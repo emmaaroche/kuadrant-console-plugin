@@ -150,12 +150,12 @@ export async function waitForPermissionsLoaded(page: Page): Promise<void> {
 // Apply test-delete-product fixture via kubectl
 // Used by delete test to ensure product exists for each run
 export async function ensureDeleteProductFixture(): Promise<void> {
-  const { execSync } = await import('child_process');
+  const { execFileSync } = await import('child_process');
   const path = await import('path');
   const fixturesPath = path.join(__dirname, '../manifests/test-apiproduct-fixtures.yaml');
 
   try {
-    execSync(`kubectl apply -f ${fixturesPath}`, { stdio: 'ignore' });
+    execFileSync('kubectl', ['apply', '-f', fixturesPath], { stdio: 'ignore' });
   } catch (error) {
     console.warn('Failed to apply test-delete-product fixture:', error);
   }
