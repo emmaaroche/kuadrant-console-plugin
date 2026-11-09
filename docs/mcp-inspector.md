@@ -81,13 +81,12 @@ plugin:
     caConfigMapName: mcp-gateway-ca # ConfigMap key: ca-bundle.crt
 ```
 
-`make oinc` deploys the backend through the operator's `CONSOLE_PLUGIN_IMAGE_OVERRIDE` (oinc has no ClusterVersion) and applies these development settings for the plain-HTTP demo before syncing the Console proxy:
-
-```bash
-kubectl --context=oinc set env deployment/kuadrant-console-plugin -n kuadrant-system \
-  MCP_PROXY_DIAL_ADDRESS=mcp-gateway-istio.gateway-system.svc.cluster.local:80 \
-  MCP_PROXY_ALLOW_INSECURE_AUTH=true
-```
+`make oinc` deploys the backend through the operator's `CONSOLE_PLUGIN_IMAGE_OVERRIDE`
+(oinc has no ClusterVersion). `scripts/setup-mcp-demo-proxy.sh` maps each demo
+public hostname to its Gateway Service's ClusterIP using the backend pod's
+`hostAliases`, removes `MCP_PROXY_DIAL_ADDRESS` so requests reach the selected
+gateway, and sets `MCP_PROXY_ALLOW_INSECURE_AUTH=true` for the plain-HTTP demos.
+`make oinc-mcp-demo` refreshes these mappings when a backend Deployment exists.
 
 To run backend changes on oinc, use `make oinc-backend`. It builds the plugin image from the working tree, loads it into oinc and switches the backend to it.
 
@@ -131,8 +130,8 @@ production policy or use `0.0.0.0/0` to make development work.
 4. Fill the schema-generated inputs. Complex object and array inputs accept JSON. Optional booleans offer **Not set**, **True**, and **False**; **Not set** omits the argument so the server can apply its own default.
 5. Optionally add MCP `_meta` key-value pairs.
 6. Use **Validate only** to check the input locally, or **Run tool** to execute it.
-7. Inspect the server result, JSON-RPC request and response, HTTP status, and elapsed time in the Output card.
-8. Switch to **Prompts** to render a prompt template. Pick a prompt, fill its arguments and use **Generate prompt**. The Output card shows the rendered messages with a copy action and a size estimate; the token count is an estimate at four characters per token, not a model tokenizer. Gateways that do not expose prompts show "This gateway does not expose prompts."
+7. The Output card opens on **Server result**, with a copy action for each result block, a result status, HTTP status, and elapsed time. Switch to **Console** to inspect the JSON-RPC request and response.
+8. Switch to **Prompts** to render a prompt template. Pick a prompt, fill its arguments and use **Generate prompt**. The Output card opens on **Prompt** with the same status summary and copy controls; **Console** shows the JSON-RPC exchange. The rendered messages include a size estimate; the token count is an estimate at four characters per token, not a model tokenizer. Gateways that do not expose prompts show "This gateway does not expose prompts."
 
 Changing gateways clears the current token, MCP session, selected tool, output, and session statistics.
 
@@ -146,12 +145,30 @@ kubectl config use-context oinc
 make oinc-mcp-demo
 ```
 
-This creates the demo namespaces, the `gateway-system/mcp-gateway` Gateway with
-its `mcp` listener, a ReferenceGrant for that Gateway,
-`mcp-gateway-system/mcp-gateway-extension`, and two Deployments,
-Services, HTTPRoutes and MCPServerRegistrations in `toystore`. The command waits
-for both Deployments and registrations and the extension to become Ready. It
-requires Istio and the MCP controller/CRDs supplied by the Kuadrant operator; it
+This creates two Gateways in `gateway-system`, each with an `mcp` listener,
+a ReferenceGrant, and an MCPGatewayExtension:
+
+| Gateway            | Extension                                            | Authentication                |
+| ------------------ | ---------------------------------------------------- | ----------------------------- |
+| `mcp-gateway`      | `mcp-gateway-system/mcp-gateway-extension`           | Anonymous                     |
+| `mcp-gateway-auth` | `mcp-gateway-auth-system/mcp-gateway-auth-extension` | `Authorization: Bearer token` |
+
+The protected gateway uses an AuthPolicy and an API-key Secret containing the
+demo credential `token`. In the Inspector, select `mcp-gateway-auth-extension`
+and enter `token` when the bearer-token dialog appears. Requests without a valid
+token receive `401` with a `WWW-Authenticate: Bearer` challenge. This uses the
+listener AuthPolicy pattern from the [MCP Gateway authentication guide](https://docs.kuadrant.io/dev/mcp-gateway/docs/guides/authentication/)
+with [API-key authentication](https://docs.kuadrant.io/dev/authorino/docs/features/#api-key-authenticationapikey)
+for the fixed demo token.
+
+The extensions use separate namespaces because their controller-managed broker
+resource names are fixed. Both gateways share the two Deployments, Services,
+HTTPRoutes and MCPServerRegistrations in `toystore`; each route attaches to both
+gateways. Setup also configures the `oinc.io/metallb` Service class and adds
+network access from the protected gateway to Authorino and the policy module.
+The command waits for both Gateways to be Programmed, both extensions,
+Deployments and registrations to become Ready, and the AuthPolicy to be Enforced. It
+requires Istio, Kuadrant's AuthPolicy/Authorino components, and the MCP controller/CRDs; it
 does not install a second MCP controller or change the Console backend image.
 
 | Inspector protocol | Sample image (under `ghcr.io/kuadrant/mcp-gateway/`) | Tool                                                | Prompt                                                       |
@@ -165,7 +182,7 @@ sample. It uses `MCP_TRANSPORT=http`, `PORT=9090`, and a separate `stateless_`
 registration prefix. Both samples use `IfNotPresent` so published images can be
 pulled or loaded locally; they are development fixtures, not pinned production images.
 
-Select the same extension for either protocol. **Auto prefers `2026-07-28`** once
+Either extension supports both protocols. **Auto prefers `2026-07-28`** once
 the gateway has discovered both backends, and shows the stateless catalog. Select
 `2025-11-25` explicitly to inspect `toystore_*`. Reconnect after installing the
 second backend if the existing connection still uses the legacy catalog.
@@ -185,6 +202,11 @@ The journey defaults to protocol `2025-11-25` and `toystore_greet` with `Name=Ad
 so adding the stateless fixture does not change its catalog. Override
 `MCP_INSPECTOR_E2E_TOOL`, `MCP_INSPECTOR_E2E_ARGUMENT_LABEL`, and
 `MCP_INSPECTOR_E2E_ARGUMENT_VALUE` for another server.
+
+To test the protected demo gateway, use
+`MCP_INSPECTOR_E2E_EXTENSION=mcp-gateway-auth-system/mcp-gateway-auth-extension`
+and `MCP_INSPECTOR_E2E_TOKEN=token` with the same journey. It checks that an
+invalid bearer token is rejected before connecting with the valid demo token.
 
 For the stateless server, exercise both its tool and its required prompt argument:
 

@@ -9,6 +9,80 @@ if [ "$(kubectl config current-context)" != "oinc" ]; then
 fi
 export MCP_INSPECTOR_E2E_EXTENSION=mcp-gateway-system/mcp-gateway-extension
 
+probe_log=$(mktemp)
+stop_probe() {
+  if [ -n "${probe_pid:-}" ]; then
+    kill "${probe_pid}" 2>/dev/null || true
+    wait "${probe_pid}" 2>/dev/null || true
+  fi
+}
+cleanup() {
+  stop_probe
+  rm -f "${probe_log}"
+}
+trap cleanup EXIT
+
+start_probe() {
+  stop_probe
+  : >"${probe_log}"
+  kubectl --context=oinc port-forward --address=127.0.0.1 -n gateway-system "service/$1-istio" :80 >"${probe_log}" 2>&1 &
+  probe_pid=$!
+}
+start_probe mcp-gateway
+
+stateless_tool=stateless_hello_world
+broker_namespace=${MCP_INSPECTOR_E2E_EXTENSION%/*}
+probe_2026() {
+  local response
+  response=$(curl --silent --max-time 5 \
+    -H 'Host: mcp.127-0-0-1.sslip.io' -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' \
+    -H "Mcp-Method: $1" \
+    --data '{"jsonrpc":"2.0","id":1,"method":"'"$1"'","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"inspector-readiness","version":"1"}}}}' \
+    "http://127.0.0.1:${probe_port}/mcp" || true)
+  if [[ "${response}" == event:* || "${response}" == data:* ]]; then
+    response=$(sed -n 's/^data: *//p' <<<"${response}")
+  fi
+  printf '%s\n' "${response}"
+}
+
+# registration Ready only means config was written. the inspector needs both
+# versions in discovery and the stateless tools over 2026-07-28; a failed
+# server/discover leaves an upstream at 2025-11-25 until the broker restarts.
+broker_restarted=false
+probe_deadline=$((SECONDS + 120))
+while true; do
+  probe_port=$(sed -n 's/^Forwarding from 127.0.0.1:\([0-9]*\) .*/\1/p' "${probe_log}" | head -1)
+  if [ -n "${probe_port}" ]; then
+    discovery=$(probe_2026 server/discover)
+    tools=$(probe_2026 tools/list)
+    if jq -e '.result.supportedVersions | contains(["2025-11-25", "2026-07-28"])' \
+      >/dev/null 2>&1 <<<"${discovery}" &&
+      jq -e --arg tool "${stateless_tool}" 'any(.result.tools[]; .name == $tool)' \
+        >/dev/null 2>&1 <<<"${tools}"; then
+      break
+    fi
+    if [ "${broker_restarted}" = false ] &&
+      jq -e '.result.supportedVersions | arrays | any(.[]; . == "2026-07-28") | not' \
+        >/dev/null 2>&1 <<<"${discovery}"; then
+      echo "broker advertises $(jq -c .result.supportedVersions <<<"${discovery}"); restarting it to rediscover upstreams" >&2
+      broker_restarted=true
+      kubectl --context=oinc rollout restart deployment/mcp-gateway -n "${broker_namespace}"
+      kubectl --context=oinc rollout status deployment/mcp-gateway -n "${broker_namespace}" --timeout=2m
+      probe_deadline=$((SECONDS + 120))
+      continue
+    fi
+  fi
+  if [ "${SECONDS}" -ge "${probe_deadline}" ] || ! kill -0 "${probe_pid}" 2>/dev/null; then
+    versions=$(jq -c '.result.supportedVersions // .error' <<<"${discovery:-null}" 2>/dev/null || echo unavailable)
+    listed=$(jq -c '(.result.tools | map(.name))? // .error' <<<"${tools:-null}" 2>/dev/null || echo unavailable)
+    echo "error: demo gateway did not become ready (versions=${versions}, tools=${listed})" >&2
+    cat "${probe_log}" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
 # Retain results separately for each protocol and authentication journey.
 journey() {
   PLAYWRIGHT_HTML_OUTPUT_DIR="playwright-report/inspector-$1" \
@@ -20,51 +94,44 @@ journey() {
 MCP_INSPECTOR_E2E_PROTOCOL=2025-11-25 journey legacy
 for protocol in 2026-07-28 auto; do
   MCP_INSPECTOR_E2E_PROTOCOL="${protocol}" \
-  MCP_INSPECTOR_E2E_TOOL=stateless_hello_world \
+  MCP_INSPECTOR_E2E_TOOL="${stateless_tool}" \
   MCP_INSPECTOR_E2E_PROMPT=stateless_greeting \
   MCP_INSPECTOR_E2E_PROMPT_ARGUMENT_LABEL=Name \
   MCP_INSPECTOR_E2E_PROMPT_OUTPUT='Please greet Ada warmly' journey "${protocol}"
 done
 
-# This fixture and credential belong only to the disposable E2E gateway.
-probe_log=$(mktemp)
-cleanup() {
-  if [ -n "${probe_pid:-}" ]; then
-    kill "${probe_pid}" 2>/dev/null || true
-    wait "${probe_pid}" 2>/dev/null || true
-  fi
-  rm -f "${probe_log}"
-  kubectl --context=oinc delete -f e2e/manifests/mcp-inspector-auth.yaml --ignore-not-found
-}
-trap cleanup EXIT
-kubectl --context=oinc apply -f e2e/manifests/mcp-inspector-auth.yaml
-kubectl --context=oinc wait authpolicy/mcp-inspector-e2e -n gateway-system --for=condition=Enforced --timeout=2m
-
-# Enforced can precede Envoy/Authorino propagation. Check both anonymous rejection
-# and valid authentication on the listener before starting the browser journey.
-kubectl --context=oinc port-forward --address=127.0.0.1 -n gateway-system service/mcp-gateway-istio :80 >"${probe_log}" 2>&1 &
-probe_pid=$!
-probe_deadline=$((SECONDS + 120))
-while true; do
-  probe_port=$(sed -n 's/^Forwarding from 127.0.0.1:\([0-9]*\) .*/\1/p' "${probe_log}" | head -1)
-  if [ -n "${probe_port}" ]; then
-    probe_args=(--silent --max-time 5 --output /dev/null --write-out '%{http_code}'
-      -H 'Host: mcp.127-0-0-1.sslip.io' -H 'Content-Type: application/json'
-      -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-11-25'
-      --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"inspector-readiness","version":"1"}}}'
-      "http://127.0.0.1:${probe_port}/mcp")
-    anonymous_status=$(curl "${probe_args[@]}" || true)
-    authenticated_status=$(curl "${probe_args[@]}" -H 'Authorization: Bearer inspector-e2e-token' || true)
-    if [ "${anonymous_status}" = 401 ] && [ "${authenticated_status}" = 200 ]; then
-      break
+wait_for_authentication() {
+  local host=$1 token=$2
+  local probe_deadline=$((SECONDS + 120))
+  local probe_port anonymous_status authenticated_status
+  local -a probe_args
+  while true; do
+    probe_port=$(sed -n 's/^Forwarding from 127.0.0.1:\([0-9]*\) .*/\1/p' "${probe_log}" | head -1)
+    if [ -n "${probe_port}" ]; then
+      probe_args=(--silent --max-time 5 --output /dev/null --write-out '%{http_code}'
+        -H "Host: ${host}" -H 'Content-Type: application/json'
+        -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-11-25'
+        --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"inspector-readiness","version":"1"}}}'
+        "http://127.0.0.1:${probe_port}/mcp")
+      anonymous_status=$(curl "${probe_args[@]}" || true)
+      authenticated_status=$(curl "${probe_args[@]}" -H "Authorization: Bearer ${token}" || true)
+      if [ "${anonymous_status}" = 401 ] && [ "${authenticated_status}" = 200 ]; then
+        break
+      fi
     fi
-  fi
-  if [ "${SECONDS}" -ge "${probe_deadline}" ] || ! kill -0 "${probe_pid}" 2>/dev/null; then
-    echo "error: authentication fixture did not become ready (anonymous=${anonymous_status:-unavailable}, authenticated=${authenticated_status:-unavailable})" >&2
-    cat "${probe_log}" >&2
-    exit 1
-  fi
-  sleep 2
-done
+    if [ "${SECONDS}" -ge "${probe_deadline}" ] || ! kill -0 "${probe_pid}" 2>/dev/null; then
+      echo "error: ${host} authentication did not become ready (anonymous=${anonymous_status:-unavailable}, authenticated=${authenticated_status:-unavailable})" >&2
+      cat "${probe_log}" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+}
+
+# the demo gateway is created with its policy; adding a gateway's first policy at
+# runtime can leave it answering 503 until its pod restarts.
+start_probe mcp-gateway-auth
+wait_for_authentication mcp-auth.127-0-0-1.sslip.io token
+MCP_INSPECTOR_E2E_EXTENSION=mcp-gateway-auth-system/mcp-gateway-auth-extension \
 MCP_INSPECTOR_E2E_PROTOCOL=2025-11-25 \
-MCP_INSPECTOR_E2E_TOKEN=inspector-e2e-token journey bearer
+MCP_INSPECTOR_E2E_TOKEN=token journey demo-bearer
